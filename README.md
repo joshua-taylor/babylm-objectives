@@ -29,7 +29,72 @@ intuition, and each gets its own axis here.
 | No graded partial credit: the update knows nothing about which alternatives fit | make the error signal graded, from an EXTERNAL anchor | `ngram_soft` |
 | The model is never trained on its own trajectories | dream, judged by external detectors | `dream` |
 
-## The two newest axes
+## The teacher ladder
+
+The organising principle, arrived at after three rounds of results:
+
+> Self-training cannot add information about the target distribution. What it
+> CAN do is convert implicit knowledge into explicit knowledge -- but only when
+> the generating process is stronger than the student. At 1M parameters there
+> is no search and no chain of thought, so the amplifier has to be:
+> **at training time we have information the causal student structurally cannot
+> access at inference time.**
+
+A teacher is therefore chosen for what it HOLDS, not for being a good language
+model. A trigram is a terrible language model. That is not the point; the point
+is complementarity.
+
+| rung | what the student lacks | arm |
+|---|---|---|
+| trigram | cross-position pooling: what followed this exact context elsewhere | `teach_trigram` |
+| varorder | adaptive-length exact match — an induction head, in the loss | `teach_varorder` |
+| cache | unbounded recency/burstiness beyond the 256-token window | `teach_cache` |
+| embed | soft context generalisation: pool over SIMILAR contexts | `teach_embed` |
+| class | distributional abstraction: mass for combinations never observed | `teach_class` |
+| mixture | labour division across rungs | `teach_mix` |
+
+`class` is the only rung that can propose a (context, token) pair absent from
+the corpus. Verified on a synthetic corpus with a deliberately held-out
+composition: exact-match teachers assign it exactly 0.0000, while `class` and
+`embed` assign it real mass. That is the ten-times-table mechanism, made
+measurable.
+
+Diagnose before training: `python run.py --teacher-report all` builds each
+teacher and prints coverage, hit rate, effective support and evidence, with no
+GPU time spent.
+
+### Loss forms
+
+`--soft-form hinge` penalises `relu(log q - log p)` on the teacher's support:
+the teacher raises a floor and never pushes anything down. Motivated by the
+same asymmetry as the dream judges — a sparse teacher is reliable when it says
+"plausible here" and unreliable when it says "implausible". The measured
+trigram hit rate is 0.596, so the mixture form moves mass off the true token
+about 40% of the time.
+
+`--soft-adaptive-lambda 1` sets `lam = lam_max * n/(n+kappa)`: Bayesian
+shrinkage on the evidence behind each context, replacing the hard `min_count`
+cutoff.
+
+## Measurement (rebuilt after run 3)
+
+Run 3's noise floor was 0.024 nats, nine times run 2's, and every arm's best
+landed at the final eval. Four fixes:
+
+* **matched-fit metric.** Comparing arms at their own minima confounds "learns
+  better" with "regularises". `val@train3.00` reads val loss at MATCHED train
+  loss. It needs no extra runs — the trace already contains it. On run 3 this
+  changed three verdicts.
+* **EMA weights** (`--ema-decay`). Under constant LR the model bounces at
+  temperature and that noise lands in the metric.
+* **robust floor** (`--robust-k`). The minimum over ~36 noisy evals is
+  downward-biased in proportion to trajectory noise, and that bias differs
+  across arms.
+* **novelty slices.** `novel_bigram_nll` is val loss restricted to (prev,
+  target) pairs never seen in training where both tokens are individually
+  frequent. That is the compositional generalisation metric, and it is free.
+
+## The two earlier axes
 
 **`ngram_soft` — graded partial credit that cannot collapse.** The target becomes
 `q = (1-lam)*onehot(y) + lam*ngram_posterior(context)`, where the posterior is a

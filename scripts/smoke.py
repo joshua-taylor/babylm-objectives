@@ -50,6 +50,12 @@ def smoke(args=None):
     args.diag_every = 1
     args.cache_dir = "./cache_smoke"
     args.ngram_anchor = 0
+    args.soft_top_m = 4
+    args.teacher_n_classes = 8
+    args.teacher_max_order = 4
+    args.cache_half_life = 32.0
+    args.ema_decay = 0.99
+    args.novelty_slices = 0
 
     corpus = synthetic_corpus(seq_len=args.seq_len)
     failures = []

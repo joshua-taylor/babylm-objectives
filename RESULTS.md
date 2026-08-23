@@ -173,3 +173,85 @@ error, not a refutation: the signal should REWEIGHT, not DISCARD. Fixed in
 4. **`selective_soft`**: sigmoid reweighting instead of hard masking.
 5. New axes: `ngram_soft` (external graded partial credit) and `dream`
    (anchored, negative-only rollout critique). See README.
+
+
+---
+
+## Run 3 (9k steps, constant LR) — the split and regime are right; the measurement was not
+
+Baseline 3.4022 nats (ppl 30.0) vs a trigram anchor of 3.745 and a uniform
+ceiling of 7.625. Data and regime are finally sound.
+
+### The summary table was misleading; the traces were not
+
+Comparing arms at their own minima confounds "learns better" with
+"regularises". Reading val loss at MATCHED train loss, from the same traces:
+
+| arm | val ppl at train ppl ~18.5 |
+|---|---|
+| **ngram_soft** | **27.9** |
+| dream | 29.5 |
+| latent_shuffle | 29.65 |
+| baseline | ~29.9 |
+| ngram_soft_uniform | never reaches this fit |
+
+At final step `ngram_soft` reached train ppl 18.22 vs baseline 18.02 -- an
+IDENTICAL fit -- with val 27.52 vs 29.22. It generalises 6% better without
+fitting less. Uniform label smoothing gets its (smaller) gain the classic way,
+by fitting worse: train 21.72. Different mechanisms, and the endpoint
+comparison conflated them. The verdict "explained by control" was an artefact
+of an entropy-mismatched control: uniform spreads lambda over 2048 tokens
+(entropy 7.6 nats), trigram over ~4 (1.43 nats).
+
+`selective_soft` was similarly underrated: (20.08, 28.71) vs baseline 30.15 at
+train ppl 20.2 -- 4.8% better at matched fit, from an arm the table called
+"within noise".
+
+### Diagnostics
+
+* `soft_anchor_hit_rate = 0.596`. The true token is independently attested
+  elsewhere 60% of the time. It also means trigram applies ~18% LESS effective
+  smoothing to the true token than uniform at the same lambda, and still wins --
+  which disfavours "it is just more regularisation". The other 40% is where the
+  mixture form moves mass off the truth, and is what the one-sided hinge fixes.
+* `soft_target_entropy = 1.429` nats -> effective support 4.2 of top-8. The
+  m=8 truncation is NOT binding; a bigger m will not help, a different teacher will.
+* `endorse_delta = +1.6 to +1.9 nats` on EVERY arm. The model assigns ~1.7 nats
+  HIGHER log-probability to tokens continuing a repeated 4-gram. This is the
+  Holtzman effect confirmed in our own setup, and it closes naive self-scoring
+  with data rather than argument.
+
+### Dream: real gain, wrong mechanism
+
+At matched fit dream beats both controls (29.43 vs 30.21 rep-only, 30.54
+random) and fits MORE than baseline while generalising better, which is not
+regulariser behaviour. But the degeneration metrics went the wrong way:
+`rep4_greedy` 0.751 vs baseline 0.721, while `dream_rep_only` improved it to
+0.677. The n-gram judge did nothing for repetition; the repetition judge did.
+So dream's perplexity gain is not a degeneration effect.
+
+Two confounds: flag rates differ 9x between dream (11.7%) and its control
+(1.3%), and across arms better perplexity CORRELATES with worse greedy
+repetition -- better models are more confident and loop more readily under
+argmax, so degeneration metrics cannot be read standalone.
+
+### Closed
+
+* **Replay, definitively.** Visit Gini 0.129 and coverage 1.0 -- the
+  anti-collapse guards worked perfectly -- and still +0.063 worse, with an
+  unstable val curve. Not collapse: gradient bias from non-i.i.d. sampling. At
+  74 epochs there is no allocation problem to solve. Three runs, three failure
+  modes, consistently negative.
+* **Latent targets.** `latent_cos_loss = 0.163` means the predictor SOLVES the
+  latent task, and it is the earliest-overfitting arm (best@4250). The task is
+  solved and solving it hurts. A pooled next-K target pulls the trunk toward
+  smooth low-frequency content -- the same pooling the retrieval line found
+  destroys precision. "Pooled values destroy retrieval" appears to extend to
+  pooled TARGETS. `latent_shuffle` beat it for the third time, so the VICReg
+  term is the only active ingredient.
+
+### Changes
+
+The teacher ladder (see README), matched controls (`shuffled`, `topm_uniform`),
+the one-sided hinge, count-adaptive lambda, matched-fit metric, EMA weights,
+robust floor, and novelty slices.

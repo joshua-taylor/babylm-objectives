@@ -67,21 +67,65 @@ ARMS = {
                                         "(2x steps). Separates the objective from the fact that "
                                         "diffusion supervises ~50%% of positions per step."),
 
-    # ---- axis 5: graded partial credit from an EXTERNAL anchor -----------
-    # The direct answer to "cross-entropy's gradient is identity-blind".
-    "ngram_soft": dict(sampler="uniform", loss="ngram_soft", soft_mode="trigram",
-                       hypothesis="Interpolating the one-hot target with a leave-one-out "
-                                  "n-gram successor distribution supplies graded, "
-                                  "corpus-grounded partial credit and lowers val loss "
-                                  "relative to both plain CE and unstructured smoothing."),
-    "ngram_soft_uniform": dict(sampler="uniform", loss="ngram_soft", soft_mode="uniform",
-                               hypothesis="CONTROL: standard label smoothing, same lambda. "
-                                          "If it matches, the gain was generic smoothing "
-                                          "and the context structure bought nothing."),
-    "ngram_soft_unigram": dict(sampler="uniform", loss="ngram_soft", soft_mode="unigram",
-                               hypothesis="CONTROL: smooth toward corpus token FREQUENCY, "
-                                          "ignoring context. Isolates 'which words are "
-                                          "common' from 'which words fit here'."),
+    # ---- THE TEACHER LADDER ---------------------------------------------
+    # Ordered by what the causal student structurally LACKS, not by teacher
+    # quality. A trigram is a terrible language model; that is not the point.
+    "teach_trigram": dict(sampler="uniform", loss="soft", teacher="trigram",
+        hypothesis="Cross-position pooling: what followed this exact context elsewhere. "
+                   "Rao-Blackwellises the training target, reducing gradient variance "
+                   "where contexts are rare."),
+    "teach_varorder": dict(sampler="uniform", loss="soft", teacher="varorder",
+        hypothesis="Adaptive-order exact match (infini-gram). This is an induction "
+                   "head's computation moved from the architecture into the loss; if it "
+                   "beats trigram, exact-match retrieval helps in either location."),
+    "teach_cache": dict(sampler="uniform", loss="soft", teacher="cache",
+        hypothesis="Unbounded recency. Burstiness over a window far wider than the "
+                   "student's 256 tokens, which it structurally cannot see."),
+    "teach_embed": dict(sampler="uniform", loss="soft", teacher="embed",
+        hypothesis="Soft context generalisation. Pools successors over SIMILAR contexts, "
+                   "attacking the ~40%% of positions where exact match has no attestation "
+                   "for the true token."),
+    "teach_class": dict(sampler="uniform", loss="soft", teacher="class",
+        hypothesis="Distributional abstraction. The only rung that can assign mass to a "
+                   "(context, token) combination absent from the corpus. Judged on "
+                   "novel_bigram_nll, not aggregate perplexity."),
+    "teach_mix": dict(sampler="uniform", loss="soft", teacher="mix:varorder+cache+class",
+        hypothesis="Labour division: exact match is precise but silent where it lacks "
+                   "attestation; abstraction is never silent but always vague. Do the "
+                   "gains ADD?"),
+
+    # ---- matched controls (the entropy-mismatched uniform control was wrong) --
+    "teach_shuffled": dict(sampler="uniform", loss="soft", teacher="shuffled:varorder",
+        hypothesis="CONTROL: identical shape, entropy, support size and count statistics; "
+                   "wrong context. This is the control that isolates the claim."),
+    "teach_topm_uniform": dict(sampler="uniform", loss="soft", teacher="topm_uniform:varorder",
+        hypothesis="CONTROL: right support, flat probabilities. Separates WHICH tokens are "
+                   "plausible from HOW plausible each is."),
+    "teach_unigram": dict(sampler="uniform", loss="soft", teacher="unigram",
+        hypothesis="CONTROL: context-free corpus frequency."),
+    "teach_uniform": dict(sampler="uniform", loss="soft", teacher="uniform",
+        hypothesis="CONTROL: classic label smoothing."),
+
+    # ---- loss-form variants on the best rung ------------------------------
+    "teach_hinge": dict(sampler="uniform", loss="soft", teacher="varorder", soft_form="hinge",
+        hypothesis="One-sided: the teacher raises a floor and never pushes anything down. "
+                   "Removes the weak-teacher ceiling and the 40%%-miss failure mode."),
+    "teach_adaptive": dict(sampler="uniform", loss="soft", teacher="varorder",
+        soft_adaptive_lambda=1,
+        hypothesis="Count-adaptive lambda: trust the teacher in proportion to the evidence "
+                   "behind it, replacing the hard min_count cutoff."),
+    "teach_best": dict(sampler="uniform", loss="soft", teacher="mix:varorder+class",
+        soft_form="hinge", soft_adaptive_lambda=1,
+        hypothesis="Everything that survived: mixture teacher, one-sided hinge, "
+                   "count-adaptive lambda."),
+
+    # ---- back-compat aliases ---------------------------------------------
+    "ngram_soft": dict(sampler="uniform", loss="soft", teacher="trigram",
+                       hypothesis="alias of teach_trigram (run-3 configuration)"),
+    "ngram_soft_uniform": dict(sampler="uniform", loss="soft", teacher="uniform",
+                               hypothesis="alias of teach_uniform"),
+    "ngram_soft_unigram": dict(sampler="uniform", loss="soft", teacher="unigram",
+                               hypothesis="alias of teach_unigram"),
 
     # ---- axis 6: dreaming, anchored, negative-only -----------------------
     "dream": dict(sampler="uniform", loss="dream", dream_judges="ngram,rep",

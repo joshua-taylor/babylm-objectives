@@ -37,10 +37,20 @@ SIZES = {
     "base":  dict(d_model=256, n_layers=4, n_heads=4, d_ff=1024),  # ~3.15M non-emb
 }
 
+LADDER_ARMS = ["teach_unigram", "teach_trigram", "teach_varorder", "teach_cache",
+               "teach_embed", "teach_class", "teach_mix"]
+
 CONTROL_OF = {
     "selective": ["selective_random", "selective_ref"],
     "selective_soft": ["selective_random"],
     "ngram_soft": ["ngram_soft_uniform", "ngram_soft_unigram"],
+    "teach_trigram": ["teach_shuffled", "teach_topm_uniform", "teach_uniform"],
+    "teach_varorder": ["teach_shuffled", "teach_topm_uniform", "teach_uniform"],
+    "teach_cache": ["teach_shuffled", "teach_uniform"],
+    "teach_embed": ["teach_shuffled", "teach_uniform"],
+    "teach_class": ["teach_shuffled", "teach_uniform"],
+    "teach_mix": ["teach_shuffled", "teach_uniform"],
+    "teach_best": ["teach_shuffled", "teach_uniform"],
     "dream": ["dream_rep_only", "dream_random"],
     "replay_progress": ["replay_hard"],
     "latent": ["latent_shuffle", "latent_frozen"],
@@ -49,11 +59,15 @@ CONTROL_OF = {
 
 SCREEN_ORDER = [
     "baseline",
-    "ngram_soft", "ngram_soft_uniform", "ngram_soft_unigram",
-    "selective_soft", "selective", "selective_random",
-    "dream", "dream_rep_only", "dream_random",
-    "replay_progress", "replay_hard",
-    "latent", "latent_shuffle",
+    # the ladder
+    "teach_trigram", "teach_varorder", "teach_cache", "teach_embed", "teach_class",
+    "teach_mix",
+    # matched controls
+    "teach_shuffled", "teach_topm_uniform", "teach_uniform",
+    # loss form
+    "teach_hinge", "teach_adaptive",
+    # survivors from earlier rounds
+    "selective_soft", "dream",
 ]
 
 
@@ -115,6 +129,15 @@ def build_parser():
     p.add_argument("--gap-spans", dest="gap_spans", type=int, default=64)
     p.add_argument("--gen-samples", dest="gen_samples", type=int, default=12)
     p.add_argument("--gen-len", dest="gen_len", type=int, default=128)
+    p.add_argument("--ema-decay", dest="ema_decay", type=float, default=0.999,
+                   help="Polyak weight averaging; 0 disables")
+    p.add_argument("--ema-warmup", dest="ema_warmup", type=int, default=500)
+    p.add_argument("--robust-k", dest="robust_k", type=int, default=3,
+                   help="robust floor = mean of the k lowest evals")
+    p.add_argument("--fit-targets", dest="fit_targets", default=None,
+                   help="comma-separated TRAIN loss levels for the matched-fit metric")
+    p.add_argument("--novelty-slices", dest="novelty_slices", type=int, default=1)
+    p.add_argument("--novelty-batches", dest="novelty_batches", type=int, default=8)
     p.add_argument("--out-dir", dest="out_dir", default="./results")
     p.add_argument("--registry", default="./results/experiments_objectives.csv")
     p.add_argument("--chat-title", dest="chat_title", default="Bio-inspired objectives on BabyLM-1M")
@@ -143,8 +166,25 @@ def build_parser():
 
     # n-gram-anchored soft targets
     p.add_argument("--soft-lambda", dest="soft_lambda", type=float, default=0.15)
-    p.add_argument("--soft-mode", dest="soft_mode", default="trigram",
-                   choices=["trigram", "uniform", "unigram"])
+    p.add_argument("--teacher", default=None,
+                   help="trigram|varorder|cache|class|embed|unigram|uniform, "
+                        "or mix:a+b, shuffled:X, topm_uniform:X")
+    p.add_argument("--soft-mode", dest="soft_mode", default="trigram")
+    p.add_argument("--soft-form", dest="soft_form", default="mixture",
+                   choices=["mixture", "hinge"])
+    p.add_argument("--soft-adaptive-lambda", dest="soft_adaptive_lambda", type=int, default=0)
+    p.add_argument("--soft-kappa", dest="soft_kappa", type=float, default=10.0)
+    p.add_argument("--teacher-order", dest="teacher_order", type=int, default=2)
+    p.add_argument("--teacher-max-order", dest="teacher_max_order", type=int, default=6)
+    p.add_argument("--teacher-n-classes", dest="teacher_n_classes", type=int, default=128)
+    p.add_argument("--teacher-emb-dim", dest="teacher_emb_dim", type=int, default=64)
+    p.add_argument("--teacher-top-classes", dest="teacher_top_classes", type=int, default=4)
+    p.add_argument("--teacher-neighbours", dest="teacher_neighbours", type=int, default=8)
+    p.add_argument("--cache-half-life", dest="cache_half_life", type=float, default=512.0)
+    p.add_argument("--cache-window", dest="cache_window", type=int, default=4096)
+    p.add_argument("--mixture-weights", dest="mixture_weights", default=None)
+    p.add_argument("--teacher-report", dest="teacher_report", default=None,
+                   help="build teachers and print their diagnostics, then exit")
     p.add_argument("--soft-top-m", dest="soft_top_m", type=int, default=8)
     p.add_argument("--soft-min-count", dest="soft_min_count", type=int, default=3)
 
@@ -204,6 +244,39 @@ def one_run(args, arm, seed):
     row = row_from_result(res, a, model, corpus)
     append_row(a.registry, row)
     return res
+
+
+def teacher_report(args):
+    """Build each teacher and print what it knows. Do this before spending GPU time."""
+    import numpy as np
+
+    from src.data import DataCfg, build_or_load
+    from src.teachers import LADDER, build_teacher
+
+    args = resolve_size(args)
+    dcfg = DataCfg(n_tokens=args.n_tokens, val_tokens=args.val_tokens,
+                   vocab_size=args.vocab_size, seq_len=args.seq_len,
+                   cache_dir=args.cache_dir)
+    corpus = build_or_load(dcfg, device="cpu")
+    specs = LADDER if args.teacher_report == "all" else args.teacher_report.split(",")
+    print(f"\ncorpus {corpus.train.numel():,} tokens | vocab {corpus.vocab_size}\n")
+    rows = []
+    for spec in specs:
+        T = build_teacher(spec, corpus.train_np, corpus.vocab_size,
+                          m=args.soft_top_m, min_count=args.soft_min_count, args=args)
+        r = T.report(*T.build(cache_dir=args.cache_dir))
+        rows.append(r)
+        print(f"{spec:28s} cov {r['coverage']:.3f}  hit {r['hit_rate']:.3f}  "
+              f"p_true {r['p_true_mean']:.3f}  eff_supp {r['eff_support']:5.2f}  "
+              f"med_ev {r['median_evidence']:8.0f}")
+        print(f"{'':28s} lacks: {r['lacks']}")
+        for k in ("order_mix", "class_singleton_frac", "mean_class_size", "WARNING"):
+            if k in r:
+                print(f"{'':28s} {k}: {r[k]}")
+    print("\nhit_rate = fraction of positions where the teacher independently attests")
+    print("the true token (leave-one-out). Low hit_rate + high p_true = confident and")
+    print("often wrong, which is what the one-sided hinge is for.")
+    return rows
 
 
 def summarise(args):
@@ -268,6 +341,9 @@ def summarise(args):
         for f in sorted(flags.get(arm, [])):
             print(f"{'':<20}   !! {f}")
     print("\nNote: `anyorder` rows are a NELBO bound, not an equal-footing loss.")
+    print("Comparing arms at their own minima confounds 'learns better' with")
+    print("'regularises'. Check val@train in the evidence column: val loss at MATCHED")
+    print("train loss is the metric that separates them.")
     bs_all = [s for v in steps.values() for s in v]
     if bs_all and len(set(bs_all)) == 1:
         print()
@@ -282,6 +358,9 @@ def summarise(args):
 
 def main():
     args = build_parser().parse_args()
+
+    if args.teacher_report:
+        return teacher_report(args)
 
     if args.summarise:
         return summarise(args)

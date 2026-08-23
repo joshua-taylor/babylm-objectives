@@ -15,12 +15,14 @@ import math
 import os
 import time
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from .data import DataCfg, build_or_load
 from .diagnostics import degeneration_report, repr_stats, self_endorsement
 from .model import LM, ModelCfg, verify_causality
+from .probes import NoveltySlices, novelty_report, val_at_matched_train
 from .objectives import build_loss, build_sampler
 
 
@@ -126,6 +128,14 @@ def run(args):
     else:
         sch = torch.optim.lr_scheduler.ConstantLR(opt, factor=1.0, total_iters=1)
 
+    # Polyak/EMA weights. Under constant LR the model bounces at temperature and
+    # that trajectory noise lands directly in the metric -- run 3's noise floor
+    # was 0.024 nats, nine times run 2's. Averaging the weights and evaluating
+    # the average is the standard fix and costs one parameter copy.
+    ema = None
+    if args.ema_decay > 0:
+        ema = {k: v.detach().clone().float() for k, v in model.state_dict().items()}
+
     amp_dtype = torch.float16 if (device == "cuda" and args.amp) else None
     scaler = torch.amp.GradScaler(device, enabled=amp_dtype is not None)
 
@@ -152,6 +162,14 @@ def run(args):
         scaler.update()
         sch.step()
         objective.on_optimizer_step(step)
+        if ema is not None:
+            d = args.ema_decay
+            with torch.no_grad():
+                for k, v in model.state_dict().items():
+                    if v.dtype.is_floating_point:
+                        ema[k].mul_(d).add_(v.detach().float(), alpha=1 - d)
+                    else:
+                        ema[k] = v.detach().clone().float()
         sampler.update(span_ids, out["per_span_nll"].float(), step)
 
         # ---- pre-registered collapse kill criterion ----
@@ -177,6 +195,10 @@ def run(args):
                   f"| tok/s {tps:,.0f}")
 
         if step % args.eval_every == 0 or step == args.n_steps:
+            backup = None
+            if ema is not None and step > args.ema_warmup:
+                backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                model.load_state_dict({k: v.to(backup[k].dtype) for k, v in ema.items()})
             if objective.supports_ar_eval:
                 vl = eval_ar(model, corpus, args.eval_batch, amp_dtype, device)
                 tl = eval_train_subset(model, corpus, args.gap_spans, args.eval_batch,
@@ -195,6 +217,8 @@ def run(args):
                 best, best_step = vl, step
             hist.append({"step": step, "val": vl, "train": tl})
             print(f"          {tag}{mark}")
+            if backup is not None:
+                model.load_state_dict(backup)
 
     elapsed = time.time() - t0
     tok_s = (step * args.batch_size * args.seq_len) / max(elapsed, 1e-6)
@@ -211,6 +235,23 @@ def run(args):
     with torch.no_grad():
         x, y, _ = corpus.spans_to_batch(torch.arange(8, device=corpus.train.device))
         diags.update({f"trunk_{k}": v for k, v in repr_stats(model.hidden(x)).items()})
+
+    fit_targets = tuple(float(t) for t in args.fit_targets.split(",")) \
+        if getattr(args, "fit_targets", None) else None
+    matched = val_at_matched_train(hist, fit_targets) if fit_targets \
+        else val_at_matched_train(hist)
+    diags.update(matched)
+    if objective.supports_ar_eval and args.novelty_slices and not killed:
+        try:
+            diags.update(novelty_report(model, corpus, NoveltySlices(corpus),
+                                        n_batches=args.novelty_batches,
+                                        amp_dtype=amp_dtype, device=device))
+        except Exception as e:
+            print(f"    (novelty slices skipped: {type(e).__name__}: {e})")
+    if hasattr(objective, "teacher_report"):
+        tr_ = objective.teacher_report()
+        print("    TEACHER: " + " | ".join(f"{k}={v}" for k, v in tr_.items()))
+        diags.update({f"T_{k}": v for k, v in tr_.items() if k != "lacks"})
 
     confounds = [kill_reason] if kill_reason else []
     if hist and best_step == hist[0]["step"] and len(hist) > 1:
@@ -234,6 +275,13 @@ def run(args):
         confounds.append(f"sampler concentration: visit Gini {g:.2f} > "
                          f"{args.replay_gini_warn}; possible replay collapse")
 
+    # The minimum over ~36 noisy evals is downward-biased in proportion to the
+    # trajectory noise, and the bias differs across arms if their noise differs.
+    # The mean of the k lowest evals is the same quantity with far less variance.
+    vals = sorted(h["val"] for h in hist) if hist else []
+    rk = max(1, min(args.robust_k, len(vals) // 4)) if vals else 1
+    robust = float(np.mean(vals[:rk])) if vals else float("nan")
+
     final = hist[-1] if hist else {"val": float("nan"), "train": float("nan")}
     res = {
         "arm": args.arm,
@@ -252,6 +300,8 @@ def run(args):
         "peak_mem_gb": round(torch.cuda.max_memory_allocated() / 1e9, 3) if device == "cuda" else "",
         "history": hist,
         "diagnostics": diags,
+        "robust_val_loss": round(robust, 5),
+        "matched_fit": matched,
         "outcome": "killed" if killed else "completed",
         "confound": " | ".join(confounds),
         "ngram_anchor_nats": None if math.isnan(anchor) else round(anchor, 5),
@@ -261,7 +311,10 @@ def run(args):
         "elapsed_s": round(elapsed, 1),
     }
 
-    print(f"\n  RESULT  best={best:.4f} nats @ step {best_step} | {elapsed/60:.1f} min")
+    print(f"\n  RESULT  best={best:.4f} robust={robust:.4f} nats @ step {best_step}"
+          f" | {elapsed/60:.1f} min")
+    if matched:
+        print("    matched-fit  " + "  ".join(f"{k}={v}" for k, v in matched.items()))
     if not math.isnan(anchor) and objective.supports_ar_eval:
         print(f"    vs trigram anchor {anchor:.4f}: "
               f"{'BEATS by ' + format(anchor-best,'.4f') if best < anchor else 'FAILS TO BEAT'}")
