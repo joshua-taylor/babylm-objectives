@@ -39,6 +39,9 @@ SIZES = {
 
 CONTROL_OF = {
     "selective": ["selective_random", "selective_ref"],
+    "selective_soft": ["selective_random"],
+    "ngram_soft": ["ngram_soft_uniform", "ngram_soft_unigram"],
+    "dream": ["dream_rep_only", "dream_random"],
     "replay_progress": ["replay_hard"],
     "latent": ["latent_shuffle", "latent_frozen"],
     "anyorder": ["anyorder_matched"],
@@ -46,11 +49,11 @@ CONTROL_OF = {
 
 SCREEN_ORDER = [
     "baseline",
-    "selective", "selective_random", "selective_ref",
+    "ngram_soft", "ngram_soft_uniform", "ngram_soft_unigram",
+    "selective_soft", "selective", "selective_random",
+    "dream", "dream_rep_only", "dream_random",
     "replay_progress", "replay_hard",
-    "latent", "latent_shuffle", "latent_frozen",
-    "mtp",
-    "anyorder", "anyorder_matched",
+    "latent", "latent_shuffle",
 ]
 
 
@@ -84,10 +87,15 @@ def build_parser():
     p.add_argument("--causal", type=int, default=1)
 
     # optimisation (identical across arms -- do not tune per arm)
-    p.add_argument("--n-steps", dest="n_steps", type=int, default=1500)
+    p.add_argument("--n-steps", dest="n_steps", type=int, default=6000)
     p.add_argument("--batch-size", dest="batch_size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--lr-schedule", dest="lr_schedule", default="cosine",
+    # Run 2 lesson: cosine anneals to 5%, so the LAST step is almost always the
+    # best and every arm's best@ landed on the final eval. That measures
+    # convergence speed, not generalisation. Constant LR exposes a true val
+    # minimum, which is the only regime where sample-efficiency claims mean
+    # anything.
+    p.add_argument("--lr-schedule", dest="lr_schedule", default="constant",
                    choices=["cosine", "constant"])
     p.add_argument("--weight-decay", dest="weight_decay", type=float, default=0.01)
     p.add_argument("--grad-clip", dest="grad_clip", type=float, default=1.0)
@@ -97,7 +105,7 @@ def build_parser():
                    help="Markov synthetic corpus; validates the loop offline. Never a result.")
 
     # eval / logging
-    p.add_argument("--eval-every", dest="eval_every", type=int, default=100)
+    p.add_argument("--eval-every", dest="eval_every", type=int, default=250)
     p.add_argument("--log-every", dest="log_every", type=int, default=250)
     p.add_argument("--ngram-anchor", dest="ngram_anchor", type=int, default=1,
                    help="fit a trigram on train, score val: the absolute floor")
@@ -129,6 +137,27 @@ def build_parser():
     p.add_argument("--selective-keep", dest="selective_keep", type=float, default=0.5)
     p.add_argument("--selective-mode", dest="selective_mode", default="excess",
                    choices=["excess", "refhigh", "random"])
+    p.add_argument("--selective-weighting", dest="selective_weighting", default="hard",
+                   choices=["hard", "soft"])
+    p.add_argument("--selective-beta", dest="selective_beta", type=float, default=1.0)
+
+    # n-gram-anchored soft targets
+    p.add_argument("--soft-lambda", dest="soft_lambda", type=float, default=0.15)
+    p.add_argument("--soft-mode", dest="soft_mode", default="trigram",
+                   choices=["trigram", "uniform", "unigram"])
+    p.add_argument("--soft-top-m", dest="soft_top_m", type=int, default=8)
+    p.add_argument("--soft-min-count", dest="soft_min_count", type=int, default=3)
+
+    # dreaming with external judges
+    p.add_argument("--dream-every", dest="dream_every", type=int, default=20)
+    p.add_argument("--dream-batch", dest="dream_batch", type=int, default=8)
+    p.add_argument("--dream-len", dest="dream_len", type=int, default=48)
+    p.add_argument("--dream-prompt", dest="dream_prompt", type=int, default=32)
+    p.add_argument("--dream-weight", dest="dream_weight", type=float, default=0.5)
+    p.add_argument("--dream-temp", dest="dream_temp", type=float, default=1.0)
+    p.add_argument("--dream-judges", dest="dream_judges", default="ngram,rep")
+    p.add_argument("--dream-rep-n", dest="dream_rep_n", type=int, default=4)
+    p.add_argument("--dream-random-rate", dest="dream_random_rate", type=float, default=0.05)
 
     # mtp
     p.add_argument("--mtp-horizon", dest="mtp_horizon", type=int, default=1)
@@ -239,8 +268,16 @@ def summarise(args):
         for f in sorted(flags.get(arm, [])):
             print(f"{'':<20}   !! {f}")
     print("\nNote: `anyorder` rows are a NELBO bound, not an equal-footing loss.")
-    print("`best@` is the step of the best val loss. If it equals the first eval,")
-    print("the arms were compared while undertrained and the ranking is not usable.")
+    bs_all = [s for v in steps.values() for s in v]
+    if bs_all and len(set(bs_all)) == 1:
+        print()
+        print("=" * 74)
+        print("WARNING: every arm's best val loss is at the SAME step. No arm reached")
+        print("a validation minimum, so this table ranks convergence speed at a")
+        print("truncated budget, not sample efficiency. In that regime plain NTP is")
+        print("optimal by construction and every alternative objective is a tax.")
+        print("Raise --n-steps until best@ is INTERIOR, and use --lr-schedule constant.")
+        print("=" * 74)
 
 
 def main():

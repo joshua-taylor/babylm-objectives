@@ -1,6 +1,8 @@
 from .anyorder import AnyOrderLoss
+from .dream import DreamLoss
 from .latent import LatentLoss
 from .samplers import build_sampler
+from .soft_targets import NgramSoftLoss
 from .token_losses import Loss, MTPLoss, NTPLoss, SelectiveLoss
 
 LOSSES = {
@@ -9,6 +11,8 @@ LOSSES = {
     "selective": SelectiveLoss,
     "latent": LatentLoss,
     "anyorder": AnyOrderLoss,
+    "ngram_soft": NgramSoftLoss,
+    "dream": DreamLoss,
 }
 
 

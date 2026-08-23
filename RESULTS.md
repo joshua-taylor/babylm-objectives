@@ -102,3 +102,74 @@ for both.
    `tiny` is 0.34M. Dropout default 0.0 -> 0.1. Vocab 4096 -> 2048.
 7. **`eval_every` 250 -> 100**, and a "best at FIRST eval" confound flag.
 8. **Summariser** dedupes by run_id and prints `best@`.
+
+
+---
+
+## Run 2 (2026-08-23) — split fixed, but WRONG REGIME. Ranking not usable.
+
+**Status: the data bug is fixed and the model genuinely learns. The comparison
+between arms is still void, for a different reason.**
+
+### What worked
+
+Baseline reached **3.6038 nats = ppl 36.7** against a uniform ceiling of
+`log(2048) = 7.625`. The block-interleaved split and the sanity gates did their
+job. Noise floor collapsed to **0.0027 nats** across 3 seeds, which is a very
+sensitive instrument.
+
+### Why the table is still void
+
+`best@` was **1500 — the final eval — for every single arm.** No arm ever reached
+a validation minimum. Two causes, both mine:
+
+1. The budget was too short. 12 epochs over 1M tokens with 0.79M non-embedding
+   params and dropout 0.1 was still firmly in the improving regime.
+2. **The LR schedule was left on cosine**, annealing to 5% of peak. That
+   structurally guarantees the last step is the best unless overfitting is strong
+   enough to overcome the anneal. It manufactures `best@last`.
+
+In a compute-limited regime, any objective that diverts gradient from next-token
+prediction is a pure tax, and the table is exactly that — monotonically ordered
+by how much gradient each arm diverts:
+
+| arm | delta vs baseline | what it diverts |
+|---|---|---|
+| latent | +0.0029 | light auxiliary head |
+| mtp | +0.0224 | full auxiliary vocabulary head |
+| latent_frozen | +0.0408 | auxiliary head, useless target |
+| replay_progress | +0.0475 | non-uniform data order |
+| selective | +0.0891 | 50% of tokens discarded |
+
+This is the *same confound* previously flagged for `mtp` alone, and it was
+allowed to contaminate all twelve arms. Run 1 was massively overfit on broken
+data; run 2 was underfit on good data.
+
+### The one real signal
+
+Isolating the selective pair, which differ only in whether the selection carries
+information:
+
+```
+selective        +0.0891   (50% sparsity + excess-surprisal signal)
+selective_random +0.1048   (50% sparsity, no signal)
+                 -------
+signal recovers   0.0157 nats = 5.8x the noise floor
+```
+
+**The excess-surprisal token-value signal is real** — comfortably above threshold
+— but it only recovers ~15% of what discarding the tokens costs. That is a design
+error, not a refutation: the signal should REWEIGHT, not DISCARD. Fixed in
+`selective_soft`, which keeps every token at mean weight 1.0.
+
+### Fixes applied
+
+1. **`--lr-schedule constant` is now the default.** A true val minimum is the
+   only regime where a sample-efficiency claim means anything.
+2. **`--n-steps` default 1500 -> 6000.** Train until val turns up.
+3. **"best at LAST eval" confound flag**, symmetric with the existing first-eval
+   flag. `--summarise` now refuses to rank the table when every arm shares the
+   same best step, and says why.
+4. **`selective_soft`**: sigmoid reweighting instead of hard masking.
+5. New axes: `ngram_soft` (external graded partial credit) and `dream`
+   (anchored, negative-only rollout critique). See README.

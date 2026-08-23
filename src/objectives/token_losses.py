@@ -122,8 +122,10 @@ class SelectiveLoss(Loss):
         ids = corpus.train.detach().cpu().numpy()
         ref = reference_nll(ids, cache_path=cache, vocab_size=corpus.vocab_size)
         self.ref = torch.from_numpy(np.asarray(ref)).to(corpus.train.device)
-        self.keep = args.selective_keep          # fraction of tokens kept
-        self.mode = args.selective_mode          # 'excess' | 'refhigh' | 'random'
+        self.keep = args.selective_keep          # fraction kept, hard-mask modes
+        self.mode = args.selective_mode          # excess | refhigh | random
+        self.weighting = args.selective_weighting  # hard | soft
+        self.beta = args.selective_beta          # soft-reweight strength
         self._last_frac = 1.0
 
     def _token_value(self, nll, y_positions):
@@ -146,12 +148,26 @@ class SelectiveLoss(Loss):
         pos = pos.clamp(max=self.ref.numel() - 1)
 
         value = self._token_value(nll, pos)
-        k = max(1, int(self.keep * T))
-        thresh = value.topk(k, dim=1).values[:, -1:]
-        mask = (value >= thresh).float()
-        self._last_frac = mask.mean().item()
 
-        loss = (nll * mask).sum() / mask.sum().clamp(min=1.0)
+        if self.weighting == "soft":
+            # Run 2 finding: hard-masking 50% of tokens costs 0.105 nats, while
+            # the excess-surprisal signal only recovers 0.016 of it. The signal
+            # is real (5.8x noise floor) but nowhere near strong enough to pay
+            # for the tokens it discards. So downweight instead of discarding:
+            # every token keeps some gradient, mean weight stays 1.0 so the
+            # effective step size is unchanged.
+            z = (value - value.mean(dim=1, keepdim=True)) / (
+                value.std(dim=1, keepdim=True) + 1e-6)
+            w = torch.sigmoid(self.beta * z)
+            w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-6)
+            self._last_frac = 1.0
+            loss = (nll * w).mean()
+        else:
+            k = max(1, int(self.keep * T))
+            thresh = value.topk(k, dim=1).values[:, -1:]
+            mask = (value >= thresh).float()
+            self._last_frac = mask.mean().item()
+            loss = (nll * mask).sum() / mask.sum().clamp(min=1.0)
         return {
             "loss": loss,
             "nll": nll.mean().detach(),

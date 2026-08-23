@@ -215,6 +215,15 @@ def run(args):
     confounds = [kill_reason] if kill_reason else []
     if hist and best_step == hist[0]["step"] and len(hist) > 1:
         confounds.append("best at FIRST eval: comparison is of undertrained models")
+    if hist and best_step == hist[-1]["step"] and len(hist) > 1:
+        # Run 2 shipped with this unflagged: every arm's best landed on the final
+        # eval, so the whole table ranked convergence speed at a truncated budget
+        # rather than generalisation. In that regime any objective that diverts
+        # gradient from next-token prediction is a pure tax and will always lose.
+        confounds.append("best at LAST eval: budget-limited, never reached a val "
+                         "minimum; measures convergence speed not generalisation"
+                         + (" (cosine LR guarantees this)"
+                            if args.lr_schedule == "cosine" else ""))
     if objective.supports_ar_eval and best >= math.log(corpus.vocab_size) * 0.99:
         confounds.append("best val at/above uniform-random ceiling: run is broken, "
                          "do not compare arms")

@@ -67,6 +67,45 @@ ARMS = {
                                         "(2x steps). Separates the objective from the fact that "
                                         "diffusion supervises ~50%% of positions per step."),
 
+    # ---- axis 5: graded partial credit from an EXTERNAL anchor -----------
+    # The direct answer to "cross-entropy's gradient is identity-blind".
+    "ngram_soft": dict(sampler="uniform", loss="ngram_soft", soft_mode="trigram",
+                       hypothesis="Interpolating the one-hot target with a leave-one-out "
+                                  "n-gram successor distribution supplies graded, "
+                                  "corpus-grounded partial credit and lowers val loss "
+                                  "relative to both plain CE and unstructured smoothing."),
+    "ngram_soft_uniform": dict(sampler="uniform", loss="ngram_soft", soft_mode="uniform",
+                               hypothesis="CONTROL: standard label smoothing, same lambda. "
+                                          "If it matches, the gain was generic smoothing "
+                                          "and the context structure bought nothing."),
+    "ngram_soft_unigram": dict(sampler="uniform", loss="ngram_soft", soft_mode="unigram",
+                               hypothesis="CONTROL: smooth toward corpus token FREQUENCY, "
+                                          "ignoring context. Isolates 'which words are "
+                                          "common' from 'which words fit here'."),
+
+    # ---- axis 6: dreaming, anchored, negative-only -----------------------
+    "dream": dict(sampler="uniform", loss="dream", dream_judges="ngram,rep",
+                  hypothesis="Rollouts judged by EXTERNAL cheap detectors (unseen corpus "
+                             "bigram, self-repetition) and penalised via unlikelihood "
+                             "reduce degeneration without costing val loss. Judged on "
+                             "rep4_greedy/distinct4_greedy, NOT on perplexity."),
+    "dream_rep_only": dict(sampler="uniform", loss="dream", dream_judges="rep",
+                           hypothesis="CONTROL: the hand-coded repetition penalty a "
+                                      "reviewer will ask for. If it matches `dream`, the "
+                                      "n-gram judge contributed nothing."),
+    "dream_random": dict(sampler="uniform", loss="dream", dream_judges="random",
+                         hypothesis="CONTROL: flag the same number of positions at random. "
+                                    "Isolates 'unlikelihood on anything' from "
+                                    "'unlikelihood on judged-bad'."),
+
+    # ---- fix for the run-2 selective failure -----------------------------
+    "selective_soft": dict(sampler="uniform", loss="selective", selective_mode="excess",
+                           selective_weighting="soft",
+                           hypothesis="Run 2: hard-masking 50%% of tokens cost 0.105 nats "
+                                      "while the excess-surprisal signal recovered only "
+                                      "0.016. Reweight instead of discard: keep every "
+                                      "token, mean weight 1.0, so the signal is free."),
+
     # ---- known quantity --------------------------------------------------
     "mtp": dict(sampler="uniform", loss="mtp",
                 hypothesis="Multi-token prediction as auxiliary loss. Prior work in this project "

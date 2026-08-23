@@ -26,6 +26,35 @@ intuition, and each gets its own axis here.
 | Epochs are allocated uniformly across the corpus regardless of where learning is happening | which *spans* get revisited | `replay_progress` |
 | The gradient on non-observed tokens is identity-blind: no partial credit in the direction of the update | what the *error signal* is made of | `latent` |
 | The objective itself is single-horizon and left-to-right | replace next-token prediction outright | `anyorder` |
+| No graded partial credit: the update knows nothing about which alternatives fit | make the error signal graded, from an EXTERNAL anchor | `ngram_soft` |
+| The model is never trained on its own trajectories | dream, judged by external detectors | `dream` |
+
+## The two newest axes
+
+**`ngram_soft` — graded partial credit that cannot collapse.** The target becomes
+`q = (1-lam)*onehot(y) + lam*ngram_posterior(context)`, where the posterior is a
+**leave-one-out** top-m successor distribution from the corpus. Leave-one-out is
+the load-bearing detail: without it a context seen once has exactly one successor
+(the true token), the soft target collapses back to one-hot, and the mechanism
+becomes a memorisation amplifier. With it, the target answers "what ELSE does the
+corpus say could follow this context" — which is exactly the graded signal plain
+cross-entropy cannot supply. The anchor is external to the weights, so no EMA
+encoder, no stop-gradient, no anti-collapse machinery is needed. Controls:
+`ngram_soft_uniform` (label smoothing) and `ngram_soft_unigram` (frequency, no
+context).
+
+**`dream` — anchored, negative-only.** Naive self-scoring is dead:
+`E_{y~p}[log p(y)]` is negative entropy, and a causal model rescoring its own
+sample recomputes the identical conditional. An n-gram model breaks the
+circularity because it is external. But it is also *weaker* than the network, so
+using it as a positive target would teach the model to be more trigram-like. The
+usable asymmetry: **a corpus n-gram model is an unreliable judge of what is good
+and a reliable judge of what is definitely wrong.** Judges (unseen corpus bigram,
+self-repetition) are therefore negative detectors only, applied via unlikelihood.
+Positives are always real data; nothing generated is ever a target. Judge this arm
+on `rep4_greedy` and `distinct4_greedy`, never on perplexity. Controls:
+`dream_rep_only` (the hand-coded penalty) and `dream_random` (same flag rate,
+no signal).
 
 ---
 
