@@ -4,8 +4,10 @@ A testbed for the question: **at a fixed and very small token budget, can someth
 other than plain next-token cross-entropy extract more from the data?**
 
 Corpus: a fixed 1M-token slice of `BabyLM-community/BabyLM-2026-Strict-Small`.
-Architecture: a deliberately standard 4-layer pre-norm transformer with RoPE,
-identical across every arm. **Nothing about the architecture varies.** If an arm
+Architecture: a deliberately standard pre-norm transformer with RoPE, identical
+across every arm. Size presets: `tiny` (0.34M params), `small` (1.05M, default),
+`base` (3.68M). At 1M tokens `base` memorises — train ppl 17 after 16 epochs — so
+`small` with dropout 0.1 is the default working point. **Nothing about the architecture varies.** If an arm
 wins, the win is attributable to the objective.
 
 ---
@@ -59,8 +61,31 @@ otherwise    = refuted, logged, closed
 `python run.py --summarise` applies this rule mechanically against the register.
 It is deliberately not a judgement call.
 
+## Sanity gates (added after run 1 shipped a broken split — see RESULTS.md)
+
+Three things print at startup and are checked automatically. They exist because
+the first version of this repo silently made the validation set a *different
+domain* from training, every arm scored at or above the uniform-random ceiling,
+and the harness cheerfully ranked twelve arms against the resulting noise.
+
+| gate | what it catches |
+|---|---|
+| unigram `KL(val \|\| train)` | distribution mismatch between the splits |
+| trigram anchor (fit train, score val) | a model that has learned nothing transferable — it must beat this |
+| uniform-random ceiling `log(vocab)` | val loss at or above it means the run is broken, printed inline |
+
+Any of these failing writes a `confound` into the register row automatically, and
+`--summarise` surfaces it under the arm. **A run that fails a gate produces no
+usable comparison, however clean the loss curve looks.**
+
 ## Pre-registered kill criteria
 
+0. **Sampler collapse (`replay_*`).** Prioritised replay has a positive feedback
+   loop: a span whose loss is falling gets sampled more, which makes it fall
+   further. Run 1 collapsed onto ~1% of spans and looked like a win. Guards:
+   a hard visit cap at `--replay-max-visit-ratio` x the uniform rate, a UCB
+   novelty bonus, and staleness decay on progress estimates. `replay_visit_gini`
+   is logged and flags a confound above `--replay-gini-warn`.
 1. **Representation collapse (`latent`).** Any objective whose targets come from
    the network itself has a trivial solution: constant representations, zero
    error, nothing learned. The effective rank of the *targets* is checked every

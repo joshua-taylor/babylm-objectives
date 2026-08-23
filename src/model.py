@@ -129,6 +129,12 @@ class LM(nn.Module):
         ps = self.parameters()
         return sum(p.numel() for p in ps if (p.requires_grad or not trainable_only))
 
+    def n_nonemb_params(self):
+        """Non-embedding parameters. At small d_model the tied embedding table
+        dominates the total, so this is the number that tracks capacity."""
+        emb = self.tok_emb.weight.numel()
+        return self.n_params() - emb
+
 
 # ---------------------------------------------------------------- checks
 @torch.no_grad()

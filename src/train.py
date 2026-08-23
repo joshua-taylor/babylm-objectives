@@ -97,9 +97,16 @@ def run(args):
     n_visits = args.n_steps * args.batch_size * args.seq_len
     print(f"\n{'='*72}\nARM: {args.arm}   (sampler={args.sampler}, loss={args.loss}, seed={args.seed})")
     print(f"{'='*72}")
-    print(f"  corpus     {corpus.train.numel():,} train / {corpus.val.numel():,} val tokens"
-          f" | vocab {corpus.vocab_size}")
-    print(f"  model      {model.n_params()/1e6:.2f}M params | causal={mcfg.causal}")
+    for line in corpus.report():
+        print(line)
+    anchor = float("nan")
+    if not getattr(args, "synthetic", 0) and args.ngram_anchor:
+        anchor = corpus.anchor(cache_dir=args.cache_dir)
+        print(f"  trigram anchor (fit train, score val) {anchor:.4f} nats"
+              f" = ppl {math.exp(min(anchor,20)):.1f}   <- the model MUST beat this")
+    print(f"  model      {model.n_params()/1e6:.2f}M params"
+          f" ({model.n_nonemb_params()/1e6:.2f}M non-embedding) | causal={mcfg.causal}"
+          f" | dropout={mcfg.dropout}")
     print(f"  budget     {args.n_steps} steps x {args.batch_size} x {args.seq_len}"
           f" = {n_visits:,} token-visits ({n_visits/corpus.train.numel():.1f} epochs)")
 
@@ -174,7 +181,10 @@ def run(args):
                 vl = eval_ar(model, corpus, args.eval_batch, amp_dtype, device)
                 tl = eval_train_subset(model, corpus, args.gap_spans, args.eval_batch,
                                        amp_dtype, device)
-                tag = f"val ppl {math.exp(min(vl,20)):7.2f} | train ppl {math.exp(min(tl,20)):7.2f} | gap {vl-tl:+.3f}"
+                ceiling = math.log(corpus.vocab_size)
+                flag = "  <<< AT/ABOVE UNIFORM-RANDOM, RUN IS BROKEN" if vl >= ceiling * 0.99 else ""
+                tag = (f"val ppl {math.exp(min(vl,20)):7.2f} | train ppl "
+                       f"{math.exp(min(tl,20)):7.2f} | gap {vl-tl:+.3f}{flag}")
             else:
                 vl = objective.eval_nelbo(corpus, n_batches=args.eval_nelbo_batches,
                                           batch_size=args.eval_batch)
@@ -202,6 +212,19 @@ def run(args):
         x, y, _ = corpus.spans_to_batch(torch.arange(8, device=corpus.train.device))
         diags.update({f"trunk_{k}": v for k, v in repr_stats(model.hidden(x)).items()})
 
+    confounds = [kill_reason] if kill_reason else []
+    if hist and best_step == hist[0]["step"] and len(hist) > 1:
+        confounds.append("best at FIRST eval: comparison is of undertrained models")
+    if objective.supports_ar_eval and best >= math.log(corpus.vocab_size) * 0.99:
+        confounds.append("best val at/above uniform-random ceiling: run is broken, "
+                         "do not compare arms")
+    if not math.isnan(anchor) and objective.supports_ar_eval and best >= anchor:
+        confounds.append(f"model failed to beat the trigram anchor ({anchor:.3f} nats)")
+    g = diags.get("replay_visit_gini")
+    if g is not None and g > args.replay_gini_warn:
+        confounds.append(f"sampler concentration: visit Gini {g:.2f} > "
+                         f"{args.replay_gini_warn}; possible replay collapse")
+
     final = hist[-1] if hist else {"val": float("nan"), "train": float("nan")}
     res = {
         "arm": args.arm,
@@ -221,12 +244,20 @@ def run(args):
         "history": hist,
         "diagnostics": diags,
         "outcome": "killed" if killed else "completed",
-        "confound": kill_reason,
+        "confound": " | ".join(confounds),
+        "ngram_anchor_nats": None if math.isnan(anchor) else round(anchor, 5),
+        "beats_anchor": (None if math.isnan(anchor) or not objective.supports_ar_eval
+                         else bool(best < anchor)),
         "token_visits": n_visits,
         "elapsed_s": round(elapsed, 1),
     }
 
     print(f"\n  RESULT  best={best:.4f} nats @ step {best_step} | {elapsed/60:.1f} min")
+    if not math.isnan(anchor) and objective.supports_ar_eval:
+        print(f"    vs trigram anchor {anchor:.4f}: "
+              f"{'BEATS by ' + format(anchor-best,'.4f') if best < anchor else 'FAILS TO BEAT'}")
+    for c in confounds:
+        print(f"    !! CONFOUND: {c}")
     for k, v in diags.items():
         print(f"    {k:32s} {v}")
 

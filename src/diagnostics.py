@@ -106,12 +106,17 @@ def rep_rate(sequences, n=4):
 
 
 @torch.no_grad()
-def generate(model, prompt_ids, max_new, seq_len, temperature=1.0, top_k=None, device="cpu"):
+def generate(model, prompt_ids, max_new, seq_len, temperature=1.0, top_k=None,
+             device="cpu", greedy=False):
     model.eval()
     x = torch.tensor([prompt_ids], device=device, dtype=torch.long)
     for _ in range(max_new):
         xi = x[:, -seq_len:]
-        logits = model(xi)[:, -1, :] / max(temperature, 1e-6)
+        logits = model(xi)[:, -1, :]
+        if greedy:
+            x = torch.cat([x, logits.argmax(-1, keepdim=True)], dim=1)
+            continue
+        logits = logits / max(temperature, 1e-6)
         if top_k:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
             logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
@@ -124,28 +129,36 @@ def generate(model, prompt_ids, max_new, seq_len, temperature=1.0, top_k=None, d
 @torch.no_grad()
 def degeneration_report(model, corpus, n_samples=16, max_new=128, temperature=1.0,
                         top_k=None, device="cpu", seed=1234):
-    """Sample continuations from val prompts and measure degeneration."""
+    """Continuations from val prompts, measured under BOTH decoders.
+
+    Sampling and greedy decoding degenerate differently, and greedy is where
+    repetition loops actually appear, so reporting only one hides the effect.
+    """
     g = torch.Generator(device=corpus.val.device).manual_seed(seed)
     prompts, _ = corpus.val_batch(n_samples, generator=g)
     prompts = prompts[:, :32].tolist()
-    outs = []
-    for p in prompts:
-        full = generate(model, p, max_new, corpus.cfg.seq_len, temperature, top_k, device)
-        outs.append(full[len(p):])
-    return {
-        "rep4": rep_rate(outs, 4),
-        "rep8": rep_rate(outs, 8),
-        "distinct1": distinct_n(outs, 1),
-        "distinct4": distinct_n(outs, 4),
-    }
+    out = {}
+    for label, kw in [("", dict(greedy=False)), ("_greedy", dict(greedy=True))]:
+        outs = [generate(model, p, max_new, corpus.cfg.seq_len, temperature, top_k,
+                         device, **kw)[len(p):] for p in prompts]
+        out[f"rep4{label}"] = rep_rate(outs, 4)
+        out[f"rep8{label}"] = rep_rate(outs, 8)
+        out[f"distinct4{label}"] = distinct_n(outs, 4)
+    return out
 
 
 # ------------------------------------------------------------------ self-endorsement
 @torch.no_grad()
 def self_endorsement(model, corpus, n_samples=16, max_new=128, n=4,
-                     temperature=1.0, device="cpu", seed=99):
+                     temperature=1.0, device="cpu", seed=99, greedy=True):
     """Does the model assign HIGHER log-prob to tokens that continue a repeated
     n-gram than to non-repeated tokens?
+
+    Decoding is GREEDY by default. The first run of this harness sampled at
+    temperature 1.0 from barely-trained models, so the "repeated n-grams" it
+    found were accidental collisions in near-random text and the metric was
+    uninformative. Degeneration loops are a MAXIMISATION-decoding phenomenon;
+    measure them where they live.
 
     Holtzman et al. (2020): in real degeneration loops the model's confidence
     RISES with each repetition. If that holds here, self-scoring cannot detect
@@ -162,7 +175,8 @@ def self_endorsement(model, corpus, n_samples=16, max_new=128, n=4,
     rep_lp, non_lp = [], []
     model.eval()
     for p in prompts:
-        full = generate(model, p, max_new, corpus.cfg.seq_len, temperature, None, device)
+        full = generate(model, p, max_new, corpus.cfg.seq_len, temperature, None, device,
+                        greedy=greedy)
         x = torch.tensor([full], device=device, dtype=torch.long)[:, -corpus.cfg.seq_len:]
         logits = model(x[:, :-1])
         lp = torch.log_softmax(logits.float(), -1)

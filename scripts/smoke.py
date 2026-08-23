@@ -38,6 +38,8 @@ def synthetic_corpus(vocab=64, n=20_000, seq_len=32, device="cpu"):
 def smoke(args=None):
     p = build_parser()
     args = p.parse_args([])
+    from run import resolve_size
+    args = resolve_size(args)
     args.seq_len = 32
     args.d_model = 32
     args.n_layers = 2
@@ -47,6 +49,7 @@ def smoke(args=None):
     args.latent_horizon = 4
     args.diag_every = 1
     args.cache_dir = "./cache_smoke"
+    args.ngram_anchor = 0
 
     corpus = synthetic_corpus(seq_len=args.seq_len)
     failures = []

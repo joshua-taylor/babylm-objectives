@@ -27,6 +27,16 @@ from src.arms import ARMS, apply_arm
 from src.registry import append_row, next_record_id, row_from_result
 from src.train import run as train_run
 
+# Size presets. At 1M tokens the first run memorised the training set (train ppl
+# 17 after 16 epochs) with `base`. `small` is the new default; `tiny` is there
+# for when even that memorises. Non-embedding params are what track capacity --
+# the tied embedding table dominates the total at small d_model.
+SIZES = {
+    "tiny":  dict(d_model=96,  n_layers=3, n_heads=3, d_ff=384),   # ~0.14M non-emb
+    "small": dict(d_model=128, n_layers=4, n_heads=4, d_ff=512),   # ~0.79M non-emb
+    "base":  dict(d_model=256, n_layers=4, n_heads=4, d_ff=1024),  # ~3.15M non-emb
+}
+
 CONTROL_OF = {
     "selective": ["selective_random", "selective_ref"],
     "replay_progress": ["replay_hard"],
@@ -57,20 +67,24 @@ def build_parser():
     # data
     p.add_argument("--n-tokens", dest="n_tokens", type=int, default=1_000_000)
     p.add_argument("--val-tokens", dest="val_tokens", type=int, default=100_000)
-    p.add_argument("--vocab-size", dest="vocab_size", type=int, default=4096)
+    p.add_argument("--vocab-size", dest="vocab_size", type=int, default=2048)
+    p.add_argument("--block-chars", dest="block_chars", type=int, default=8192)
+    p.add_argument("--split-seed", dest="split_seed", type=int, default=0)
     p.add_argument("--seq-len", dest="seq_len", type=int, default=256)
     p.add_argument("--cache-dir", dest="cache_dir", default="./cache")
 
     # model
-    p.add_argument("--d-model", dest="d_model", type=int, default=256)
-    p.add_argument("--n-layers", dest="n_layers", type=int, default=4)
-    p.add_argument("--n-heads", dest="n_heads", type=int, default=4)
-    p.add_argument("--d-ff", dest="d_ff", type=int, default=1024)
-    p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--size", default="small", choices=sorted(SIZES),
+                   help="preset; explicit --d-model etc. override it")
+    p.add_argument("--d-model", dest="d_model", type=int, default=None)
+    p.add_argument("--n-layers", dest="n_layers", type=int, default=None)
+    p.add_argument("--n-heads", dest="n_heads", type=int, default=None)
+    p.add_argument("--d-ff", dest="d_ff", type=int, default=None)
+    p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--causal", type=int, default=1)
 
     # optimisation (identical across arms -- do not tune per arm)
-    p.add_argument("--n-steps", dest="n_steps", type=int, default=2000)
+    p.add_argument("--n-steps", dest="n_steps", type=int, default=1500)
     p.add_argument("--batch-size", dest="batch_size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--lr-schedule", dest="lr_schedule", default="cosine",
@@ -83,8 +97,10 @@ def build_parser():
                    help="Markov synthetic corpus; validates the loop offline. Never a result.")
 
     # eval / logging
-    p.add_argument("--eval-every", dest="eval_every", type=int, default=250)
+    p.add_argument("--eval-every", dest="eval_every", type=int, default=100)
     p.add_argument("--log-every", dest="log_every", type=int, default=250)
+    p.add_argument("--ngram-anchor", dest="ngram_anchor", type=int, default=1,
+                   help="fit a trigram on train, score val: the absolute floor")
     p.add_argument("--diag-every", dest="diag_every", type=int, default=100)
     p.add_argument("--eval-batch", dest="eval_batch", type=int, default=32)
     p.add_argument("--eval-nelbo-batches", dest="eval_nelbo_batches", type=int, default=12)
@@ -98,9 +114,16 @@ def build_parser():
     # replay
     p.add_argument("--replay-beta-fast", dest="replay_beta_fast", type=float, default=0.7)
     p.add_argument("--replay-beta-slow", dest="replay_beta_slow", type=float, default=0.95)
-    p.add_argument("--replay-temp", dest="replay_temp", type=float, default=0.5)
-    p.add_argument("--replay-eps", dest="replay_eps", type=float, default=0.1)
+    p.add_argument("--replay-temp", dest="replay_temp", type=float, default=1.0)
+    p.add_argument("--replay-eps", dest="replay_eps", type=float, default=0.15)
     p.add_argument("--replay-warmup", dest="replay_warmup", type=int, default=200)
+    p.add_argument("--replay-novelty", dest="replay_novelty", type=float, default=0.5,
+                   help="UCB bonus weight; 0 disables")
+    p.add_argument("--replay-max-visit-ratio", dest="replay_max_visit_ratio",
+                   type=float, default=4.0, help="hard visit cap vs uniform rate; 0 disables")
+    p.add_argument("--replay-stale-halflife", dest="replay_stale_halflife",
+                   type=float, default=300.0)
+    p.add_argument("--replay-gini-warn", dest="replay_gini_warn", type=float, default=0.45)
 
     # selective
     p.add_argument("--selective-keep", dest="selective_keep", type=float, default=0.5)
@@ -127,10 +150,19 @@ def build_parser():
     return p
 
 
+def resolve_size(args):
+    preset = SIZES[args.size]
+    for k, v in preset.items():
+        if getattr(args, k, None) is None:
+            setattr(args, k, v)
+    return args
+
+
 def one_run(args, arm, seed):
     import copy
 
     a = copy.deepcopy(args)
+    a = resolve_size(a)
     a = apply_arm(a, arm)
     a.arm = arm
     a.seed = seed
@@ -152,13 +184,24 @@ def summarise(args):
         print("no registry yet")
         return
     rows = list(csv.DictReader(open(args.registry)))
-    by_arm = {}
+    seen, by_arm, steps, flags = set(), {}, {}, {}
     for r in rows:
+        rid = r.get("run_id", "")
+        if rid in seen:          # reruns of the same arm+seed must not inflate n
+            continue
+        seen.add(rid)
         try:
             v = float(r["metric_primary_value"])
         except (ValueError, KeyError):
             continue
-        by_arm.setdefault(r["model_name"], []).append(v)
+        a = r["model_name"]
+        by_arm.setdefault(a, []).append(v)
+        try:
+            steps.setdefault(a, []).append(int(r.get("best_step") or 0))
+        except ValueError:
+            pass
+        if r.get("confound"):
+            flags.setdefault(a, set()).add(r["confound"].split(" | ")[0][:40])
 
     if "baseline" not in by_arm:
         print("run `--arm baseline --seeds 3` first to establish the noise floor")
@@ -167,8 +210,8 @@ def summarise(args):
     nf = statistics.stdev(base) if len(base) > 1 else float("nan")
     print(f"\nbaseline: mean {statistics.mean(base):.4f} nats over {len(base)} seed(s)")
     print(f"noise floor (std): {nf:.4f}   threshold = 2x = {2*nf:.4f}\n")
-    print(f"{'arm':<20} {'n':>3} {'mean':>9} {'delta':>9} {'verdict':>28}")
-    print("-" * 74)
+    print(f"{'arm':<20} {'n':>3} {'mean':>9} {'delta':>9} {'best@':>7} {'verdict':>30}")
+    print("-" * 84)
     for arm, vs in sorted(by_arm.items(), key=lambda kv: statistics.mean(kv[1])):
         m = statistics.mean(vs)
         d = m - statistics.mean(base)
@@ -191,8 +234,13 @@ def summarise(args):
                 verdict = "explained by control"
         else:
             verdict = "refuted (within noise)"
-        print(f"{arm:<20} {len(vs):>3} {m:>9.4f} {d:>+9.4f} {verdict:>28}")
+        bs = statistics.mean(steps.get(arm, [0])) if steps.get(arm) else 0
+        print(f"{arm:<20} {len(vs):>3} {m:>9.4f} {d:>+9.4f} {bs:>7.0f} {verdict:>30}")
+        for f in sorted(flags.get(arm, [])):
+            print(f"{'':<20}   !! {f}")
     print("\nNote: `anyorder` rows are a NELBO bound, not an equal-footing loss.")
+    print("`best@` is the step of the best val loss. If it equals the first eval,")
+    print("the arms were compared while undertrained and the ranking is not usable.")
 
 
 def main():
