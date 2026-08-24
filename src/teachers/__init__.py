@@ -19,6 +19,7 @@ from .cache import CacheTeacher
 from .classes import ClassTeacher, EmbedTeacher
 from .controls import (MixtureTeacher, ShuffledTeacher, TopMUniformTeacher,
                        UniformTeacher, UnigramTeacher)
+from .neural import NeuralTeacher
 from .ngram import NgramTeacher, VarOrderTeacher
 
 BASE = {
@@ -27,6 +28,7 @@ BASE = {
     "cache": CacheTeacher,
     "class": ClassTeacher,
     "embed": EmbedTeacher,
+    "neural": NeuralTeacher,
     "unigram": UnigramTeacher,
     "uniform": UniformTeacher,
 }
@@ -48,6 +50,8 @@ def _kw(name, args):
     if name == "class":
         return {"n_classes": g("teacher_n_classes", 128), "emb_dim": g("teacher_emb_dim", 64),
                 "top_classes": g("teacher_top_classes", 4)}
+    if name == "neural":
+        return {"table_path": g("teacher_table", None)}
     if name == "embed":
         return {"emb_dim": g("teacher_emb_dim", 64), "n_neighbours": g("teacher_neighbours", 8)}
     return {}

@@ -94,6 +94,40 @@ ARMS = {
                    "attestation; abstraction is never silent but always vague. Do the "
                    "gains ADD?"),
 
+    # ---- SUPPORT-ONLY DISTILLATION (the headline test) -------------------
+    # Classical distillation transfers the teacher's full distribution, which is
+    # what makes it expensive at scale. Run 4 says only the SUPPORT matters. If
+    # that holds for a neural teacher, distillation needs 8 int16 per token
+    # instead of a full distribution -- four orders of magnitude cheaper.
+    "teach_neural": dict(sampler="uniform", loss="soft", teacher="neural", soft_flatten=1,
+        hypothesis="Support-only distillation: a larger model's top-k IDs, FLATTENED. "
+                   "Tests whether the run-4 finding (support carries the signal, "
+                   "probabilities do not) generalises from n-gram to neural teachers."),
+    "teach_neural_probs": dict(sampler="uniform", loss="soft", teacher="neural",
+        hypothesis="CLASSICAL distillation: the same top-k WITH probabilities. The "
+                   "direct comparison. If teach_neural matches this, the teacher's "
+                   "probability structure is unnecessary."),
+    "teach_neural_shuffled": dict(sampler="uniform", loss="soft",
+        teacher="shuffled:neural", soft_flatten=1,
+        hypothesis="CONTROL: the neural teacher's rows from wrong positions. Matched "
+                   "shape and entropy, no context."),
+
+    # ---- THE CHEAP CONTROL THAT COULD COLLAPSE THE LADDER ----------------
+    "teach_self": dict(sampler="uniform", loss="soft", teacher="self",
+        hypothesis="The model's OWN EMA top-k, flattened. No table, no corpus "
+                   "statistics, no external teacher, scales for free. If this matches "
+                   "the n-gram teacher the whole ladder is unnecessary and the result "
+                   "is a one-line trick. Run this before anything else."),
+    "teach_self_probs": dict(sampler="uniform", loss="soft", teacher="self_probs",
+        hypothesis="Self-distillation from the EMA copy WITH probabilities. Expected to "
+                   "be closer to the entropy-knob failure mode than teach_self, since "
+                   "self-referential probabilities reduce to an entropy adjustment."),
+    "teach_self_excl": dict(sampler="uniform", loss="soft", teacher="self",
+        self_exclude_true=1,
+        hypothesis="EMA top-k with the true token EXCLUDED from the support: pure "
+                   "'plausible alternatives'. Separates the candidate set from any "
+                   "reinforcement of the observed token."),
+
     # ---- matched controls (the entropy-mismatched uniform control was wrong) --
     "teach_shuffled": dict(sampler="uniform", loss="soft", teacher="shuffled:varorder",
         hypothesis="CONTROL: identical shape, entropy, support size and count statistics; "

@@ -80,3 +80,78 @@ anything.
   keep the same `--registry` path (append-only). Download it between sessions.
 * `--lr-schedule constant` when you want the achievable floor rather than a
   fixed-budget number.
+
+
+---
+
+# Run 5: support-only distillation + the self-teacher control
+
+## Cell A — setup
+
+```python
+!pip -q install datasets tokenizers 2>/dev/null
+!rm -rf /kaggle/working/babylm-objectives
+!git clone -q https://github.com/joshua-taylor/babylm-objectives.git /kaggle/working/babylm-objectives
+%cd /kaggle/working/babylm-objectives
+!python -m scripts.smoke
+```
+
+## Cell B — the cheap control FIRST (~25 min)
+
+If the model's own EMA top-k matches the n-gram teacher, the whole ladder is
+unnecessary. Find out before spending anything else.
+
+```python
+!python run.py --stage screen --seeds 5 \
+    --arms baseline,teach_self,teach_self_probs,teach_varorder,teach_topm_uniform \
+    --n-steps 9000 --lr-schedule constant \
+    --cache-dir /kaggle/working/cache --out-dir /kaggle/working/results \
+    --registry /kaggle/working/results/exp.csv
+
+!python run.py --summarise --registry /kaggle/working/results/exp.csv --fit-at 3.10
+```
+
+## Cell C — train the teacher, then the three-way distillation test (~45 min)
+
+```python
+!python -m scripts.train_teacher --teacher-size base --teacher-k 64 \
+    --n-steps 9000 --lr-schedule constant \
+    --cache-dir /kaggle/working/cache --out-dir /kaggle/working/results \
+    --registry /kaggle/working/results/exp.csv
+```
+
+Note the printed table path, then:
+
+```python
+TABLE = "/kaggle/working/cache/teacher_neural_base_v2048_n1000000.npz"
+!python run.py --stage screen --seeds 5 \
+    --arms teach_neural,teach_neural_probs,teach_neural_shuffled \
+    --teacher-table {TABLE} --n-steps 9000 --lr-schedule constant \
+    --cache-dir /kaggle/working/cache --out-dir /kaggle/working/results \
+    --registry /kaggle/working/results/exp.csv
+
+!python run.py --summarise --registry /kaggle/working/results/exp.csv --fit-at 3.10
+```
+
+**The headline number is `teach_neural` minus `teach_neural_probs`.** If |t| < 2,
+the teacher's probabilities are unnecessary and support-only distillation works.
+
+## Cell D — support-size sweep (free, the table is cached at K=64)
+
+```python
+!python run.py --stage sweep --arm teach_neural --seeds 3 \
+    --sweep-param soft-top-m --sweep-values 1,2,4,8,16,32 \
+    --teacher-table {TABLE} --n-steps 9000 --lr-schedule constant \
+    --cache-dir /kaggle/working/cache --out-dir /kaggle/working/results \
+    --registry /kaggle/working/results/exp.csv
+```
+
+Support size is now the central variable and has only ever been tested at m=8.
+
+## Reading the output
+
+* `t` is the difference over its own standard error (Welch). |t| > 2 is the bar.
+* `fit` is val loss at matched TRAIN loss — separates "learns better" from
+  "regularises". Prefer it to the raw delta.
+* If every arm shows `best at LAST eval`, raise `--n-steps` — the table is
+  ranking convergence speed, not sample efficiency.

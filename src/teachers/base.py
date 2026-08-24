@@ -162,6 +162,22 @@ def loo_normalise(idx, cnt, total, y, m):
     return idx.astype(np.int32), prob.astype(np.float32), tot.astype(np.float32), mass
 
 
+def truncate_topm(idx, prob, m):
+    """Narrow a cached top-K table to top-m and renormalise.
+
+    Lets teachers be cached once at a wide K and reused across an m sweep, which
+    matters now that support size is the central variable rather than a detail.
+    """
+    if m >= idx.shape[1]:
+        return idx, prob
+    o = np.argsort(-prob, axis=1, kind="stable")[:, :m]
+    i2 = np.take_along_axis(idx, o, 1)
+    p2 = np.take_along_axis(prob, o, 1)
+    s = p2.sum(1, keepdims=True)
+    p2 = np.where(s > 0, p2 / np.maximum(s, 1e-12), 0.0)
+    return i2.astype(np.int32), p2.astype(np.float32)
+
+
 # --------------------------------------------------------------------------
 class Teacher:
     """Produces (idx, prob, count, mass) aligned with the training corpus.
@@ -200,10 +216,26 @@ class Teacher:
             path = os.path.join(cache_dir, f"teacher_{self.name}_{self._tag()}.npz")
             if os.path.exists(path):
                 z = np.load(path)
+                # Restore build-time diagnostics too. Without this a cached
+                # teacher reports nan for everything computed inside _compute
+                # (e.g. class_singleton_frac), which silently hides the exact
+                # degeneracy the diagnostic exists to catch.
+                side = path.replace(".npz", ".json")
+                if os.path.exists(side):
+                    import json
+                    for k, v in json.load(open(side)).items():
+                        setattr(self, k, v)
                 return z["idx"], z["prob"], z["count"], z["mass"]
         idx, prob, count, mass = self._compute()
         if path:
             np.savez_compressed(path, idx=idx, prob=prob, count=count, mass=mass)
+            import json
+            extra = {k: v for k, v in self.__dict__.items()
+                     if k in ("singleton_frac", "mean_class_size", "order_hist")}
+            if "order_hist" in extra:
+                extra["order_hist"] = [int(x) for x in extra["order_hist"]]
+            if extra:
+                json.dump(extra, open(path.replace(".npz", ".json"), "w"))
         return idx, prob, count, mass
 
     # ---------------------------------------------------------- diagnostics

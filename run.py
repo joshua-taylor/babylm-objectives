@@ -16,6 +16,7 @@ Decision rule (pre-registered, do not change after seeing results)
 """
 
 import argparse
+import copy
 import json
 import os
 import statistics
@@ -59,6 +60,8 @@ CONTROL_OF = {
 
 SCREEN_ORDER = [
     "baseline",
+    "teach_self", "teach_self_probs",
+    "teach_neural", "teach_neural_probs", "teach_neural_shuffled",
     # the ladder
     "teach_trigram", "teach_varorder", "teach_cache", "teach_embed", "teach_class",
     "teach_mix",
@@ -77,8 +80,15 @@ def build_parser():
     p.add_argument("--arm", default="baseline", choices=sorted(ARMS))
     p.add_argument("--seeds", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--stage", default=None, choices=["screen", "noisefloor"])
+    p.add_argument("--stage", default=None,
+                   choices=["screen", "noisefloor", "sweep"])
+    p.add_argument("--arms", default=None,
+                   help="comma-separated arm list, overrides SCREEN_ORDER")
+    p.add_argument("--sweep-param", dest="sweep_param", default="soft-top-m")
+    p.add_argument("--sweep-values", dest="sweep_values", default="2,4,8,16,32")
     p.add_argument("--summarise", action="store_true")
+    p.add_argument("--metric", default="robust", choices=["robust", "best"])
+    p.add_argument("--fit-at", dest="fit_at", default="3.10")
     p.add_argument("--smoke", action="store_true")
 
     # data
@@ -183,6 +193,15 @@ def build_parser():
     p.add_argument("--cache-half-life", dest="cache_half_life", type=float, default=512.0)
     p.add_argument("--cache-window", dest="cache_window", type=int, default=4096)
     p.add_argument("--mixture-weights", dest="mixture_weights", default=None)
+    p.add_argument("--teacher-table", dest="teacher_table", default=None,
+                   help="path to a cached neural-teacher npz (scripts/train_teacher.py)")
+    p.add_argument("--soft-flatten", dest="soft_flatten", type=int, default=0,
+                   help="discard teacher probabilities, keep support only")
+    p.add_argument("--teacher-cache-m", dest="teacher_cache_m", type=int, default=32,
+                   help="cache teachers this wide; --soft-top-m truncates at use")
+    p.add_argument("--self-momentum", dest="self_momentum", type=float, default=0.999)
+    p.add_argument("--self-warmup", dest="self_warmup", type=int, default=1000)
+    p.add_argument("--self-exclude-true", dest="self_exclude_true", type=int, default=0)
     p.add_argument("--teacher-report", dest="teacher_report", default=None,
                    help="build teachers and print their diagnostics, then exit")
     p.add_argument("--soft-top-m", dest="soft_top_m", type=int, default=8)
@@ -227,9 +246,7 @@ def resolve_size(args):
     return args
 
 
-def one_run(args, arm, seed):
-    import copy
-
+def one_run(args, arm, seed, tag=None):
     a = copy.deepcopy(args)
     a = resolve_size(a)
     a = apply_arm(a, arm)
@@ -239,7 +256,9 @@ def one_run(args, arm, seed):
         a.n_steps = a.n_steps * 2
         print(f"  [match-supervision] doubling steps to {a.n_steps}")
     res, model, corpus = train_run(a)
-    res["run_id"] = f"{arm}_s{seed}"
+    res["run_id"] = f"{arm}_{tag}_s{seed}" if tag else f"{arm}_s{seed}"
+    if tag:
+        res["arm"] = f"{arm}[{tag}]"
     res["record_id"] = next_record_id(a.registry)
     row = row_from_result(res, a, model, corpus)
     append_row(a.registry, row)
@@ -279,17 +298,36 @@ def teacher_report(args):
     return rows
 
 
+def _welch(a, b):
+    """Welch's t on the DIFFERENCE between two arms.
+
+    The old rule -- beat baseline by 2x the baseline's own std -- is the wrong
+    test. It ignores the arm's own variance entirely, and it uses a threshold
+    rather than a standard error on the quantity actually being estimated. This
+    returns (mean difference, standard error of that difference, n_a, n_b).
+    """
+    import math
+
+    na, nb = len(a), len(b)
+    ma, mb = statistics.mean(a), statistics.mean(b)
+    va = statistics.variance(a) if na > 1 else 0.0
+    vb = statistics.variance(b) if nb > 1 else 0.0
+    se = math.sqrt(va / max(na, 1) + vb / max(nb, 1))
+    return ma - mb, se, na, nb
+
+
 def summarise(args):
     import csv
+    import json as _json
 
     if not os.path.exists(args.registry):
         print("no registry yet")
         return
     rows = list(csv.DictReader(open(args.registry)))
-    seen, by_arm, steps, flags = set(), {}, {}, {}
+    seen, by_arm, steps, flags, fits = set(), {}, {}, {}, {}
     for r in rows:
         rid = r.get("run_id", "")
-        if rid in seen:          # reruns of the same arm+seed must not inflate n
+        if rid in seen:
             continue
         seen.add(rid)
         try:
@@ -303,56 +341,70 @@ def summarise(args):
         except ValueError:
             pass
         if r.get("confound"):
-            flags.setdefault(a, set()).add(r["confound"].split(" | ")[0][:40])
+            flags.setdefault(a, set()).add(r["confound"].split(" | ")[0][:44])
+        try:
+            ev = _json.loads(r.get("evidence") or "{}")
+            key = f"val@train{args.fit_at}"
+            if key in ev:
+                fits.setdefault(a, []).append(float(ev[key]))
+        except Exception:
+            pass
 
     if "baseline" not in by_arm:
-        print("run `--arm baseline --seeds 3` first to establish the noise floor")
+        print("run `--stage noisefloor` first to establish the noise floor")
         return
     base = by_arm["baseline"]
-    nf = statistics.stdev(base) if len(base) > 1 else float("nan")
-    print(f"\nbaseline: mean {statistics.mean(base):.4f} nats over {len(base)} seed(s)")
-    print(f"noise floor (std): {nf:.4f}   threshold = 2x = {2*nf:.4f}\n")
-    print(f"{'arm':<20} {'n':>3} {'mean':>9} {'delta':>9} {'best@':>7} {'verdict':>30}")
-    print("-" * 84)
+    nb = len(base)
+    sd = statistics.stdev(base) if nb > 1 else float("nan")
+    print(f"\nbaseline: {statistics.mean(base):.4f} nats over {nb} seed(s), sd {sd:.4f}")
+    if nb < 3:
+        print("!! fewer than 3 baseline seeds: no usable noise floor.")
+    print(f"metric: {args.metric}   matched-fit column: val@train{args.fit_at}\n")
+
+    hdr = (f"{'arm':<22} {'n':>2} {'mean':>8} {'delta':>8} {'SE':>7} "
+           f"{'t':>6} {'fit':>8} {'verdict':>26}")
+    print(hdr)
+    print("-" * len(hdr))
     for arm, vs in sorted(by_arm.items(), key=lambda kv: statistics.mean(kv[1])):
-        m = statistics.mean(vs)
-        d = m - statistics.mean(base)
+        d, se, na, _ = _welch(vs, base)
+        t = d / se if se > 0 else float("nan")
+        f = statistics.mean(fits[arm]) if fits.get(arm) else float("nan")
         if arm == "baseline":
             verdict = "reference"
         elif arm.startswith("anyorder"):
             verdict = "NELBO bound, not comparable"
-        elif nf != nf:
-            verdict = "no noise floor yet"
-        elif d > 2 * nf:
-            verdict = "worse than baseline"
-        elif d < -2 * nf:
+        elif na < 2 or nb < 2:
+            verdict = "need >=2 seeds both sides"
+        elif t < -2:
             ctrls = CONTROL_OF.get(arm, [])
-            cvals = [statistics.mean(by_arm[c]) for c in ctrls if c in by_arm]
-            if not cvals:
+            cv = [by_arm[c] for c in ctrls if c in by_arm and len(by_arm[c]) > 1]
+            if not cv:
                 verdict = "beats baseline; run control"
-            elif m < min(cvals) - 2 * nf:
-                verdict = "REAL (beats baseline + control)"
             else:
-                verdict = "explained by control"
+                worst = max(cv, key=statistics.mean)
+                dc, sec, _, _ = _welch(vs, worst)
+                tc = dc / sec if sec > 0 else float("nan")
+                verdict = ("REAL (beats baseline+control)" if tc < -2
+                           else "explained by control")
+        elif t > 2:
+            verdict = "worse than baseline"
         else:
-            verdict = "refuted (within noise)"
-        bs = statistics.mean(steps.get(arm, [0])) if steps.get(arm) else 0
-        print(f"{arm:<20} {len(vs):>3} {m:>9.4f} {d:>+9.4f} {bs:>7.0f} {verdict:>30}")
-        for f in sorted(flags.get(arm, [])):
-            print(f"{'':<20}   !! {f}")
-    print("\nNote: `anyorder` rows are a NELBO bound, not an equal-footing loss.")
-    print("Comparing arms at their own minima confounds 'learns better' with")
-    print("'regularises'. Check val@train in the evidence column: val loss at MATCHED")
-    print("train loss is the metric that separates them.")
-    bs_all = [s for v in steps.values() for s in v]
+            verdict = "within noise"
+        print(f"{arm:<22} {na:>2} {statistics.mean(vs):>8.4f} {d:>+8.4f} {se:>7.4f} "
+              f"{t:>6.2f} {f:>8.4f} {verdict:>26}")
+        for fl in sorted(flags.get(arm, [])):
+            print(f"{'':<22}   !! {fl}")
+
+    print("\n`t` is the difference divided by its own standard error (Welch), not")
+    print("a fixed multiple of the baseline's spread. |t| > 2 is the bar.")
+    print("`fit` is val loss at MATCHED train loss -- it separates 'learns better'")
+    print("from 'regularises', which comparing minima cannot.")
+    bs_all = [x for v in steps.values() for x in v]
     if bs_all and len(set(bs_all)) == 1:
-        print()
-        print("=" * 74)
+        print("\n" + "=" * 74)
         print("WARNING: every arm's best val loss is at the SAME step. No arm reached")
-        print("a validation minimum, so this table ranks convergence speed at a")
-        print("truncated budget, not sample efficiency. In that regime plain NTP is")
-        print("optimal by construction and every alternative objective is a tax.")
-        print("Raise --n-steps until best@ is INTERIOR, and use --lr-schedule constant.")
+        print("a validation minimum, so this ranks convergence speed at a truncated")
+        print("budget, not sample efficiency. Raise --n-steps until best@ is INTERIOR.")
         print("=" * 74)
 
 
@@ -375,11 +427,34 @@ def main():
         return summarise(args)
 
     if args.stage == "screen":
-        for arm in SCREEN_ORDER:
-            try:
-                one_run(args, arm, args.seed)
-            except Exception as e:  # one broken arm must not kill the sweep
-                print(f"  !! arm {arm} failed: {type(e).__name__}: {e}")
+        # BUG FIXED (run 4): this ignored --seeds and ran one seed per arm, which
+        # is why an entire screen came back n=1 with "no noise floor yet" despite
+        # --seeds 3 being passed. Nothing in that table was testable.
+        arms = args.arms.split(",") if args.arms else SCREEN_ORDER
+        print(f"screening {len(arms)} arms x {args.seeds} seed(s) = "
+              f"{len(arms) * args.seeds} runs")
+        for arm in arms:
+            for i in range(args.seeds):
+                try:
+                    one_run(args, arm, args.seed + i)
+                except Exception as e:  # one broken arm must not kill the sweep
+                    print(f"  !! arm {arm} seed {args.seed+i} failed: "
+                          f"{type(e).__name__}: {e}")
+        return summarise(args)
+
+    if args.stage == "sweep":
+        vals = [float(v) for v in args.sweep_values.split(",")]
+        print(f"sweeping --{args.sweep_param} over {vals} on arm {args.arm}")
+        for v in vals:
+            for i in range(args.seeds):
+                a = copy.deepcopy(args)
+                setattr(a, args.sweep_param.replace("-", "_"),
+                        int(v) if float(v).is_integer() and args.sweep_param != "soft-lambda" else v)
+                a.sweep_tag = f"{args.sweep_param}={v}"
+                try:
+                    one_run(a, args.arm, args.seed + i, tag=f"{args.sweep_param}{v}")
+                except Exception as e:
+                    print(f"  !! {args.sweep_param}={v} failed: {type(e).__name__}: {e}")
         return summarise(args)
 
     results = [one_run(args, args.arm, args.seed + i) for i in range(args.seeds)]

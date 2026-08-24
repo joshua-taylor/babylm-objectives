@@ -56,8 +56,21 @@ def smoke(args=None):
     args.cache_half_life = 32.0
     args.ema_decay = 0.99
     args.novelty_slices = 0
+    args.self_warmup = 0
+    args.self_momentum = 0.9
+    args.teacher_cache_m = 8
 
     corpus = synthetic_corpus(seq_len=args.seq_len)
+    os.makedirs(args.cache_dir, exist_ok=True)
+    fake = os.path.join(args.cache_dir, "teacher_neural_smoke.npz")
+    rng = np.random.default_rng(0)
+    N, K = corpus.train.numel(), 8
+    fi = rng.integers(0, corpus.vocab_size, (N, K)).astype(np.int32)
+    fp = rng.random((N, K)).astype(np.float32)
+    fp /= fp.sum(1, keepdims=True)
+    np.savez_compressed(fake, idx=fi, prob=fp, val_nats=np.array(1.0),
+                        params_m=np.array(1.0))
+    args.teacher_table = fake
     failures = []
 
     for arm in sorted(ARMS):

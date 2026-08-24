@@ -76,6 +76,57 @@ about 40% of the time.
 shrinkage on the evidence behind each context, replacing the hard `min_count`
 cutoff.
 
+## Support-only distillation (the headline test)
+
+Run 4 found that `topm_uniform` — the teacher's candidate set with the
+probabilities **thrown away and flattened** — matched or beat the full teacher.
+The *identity* of the plausible tokens carried the signal; the probability
+structure carried nothing measurable.
+
+That was a trigram teacher. Whether it holds for a **neural** teacher is both
+untested and consequential. Classical distillation transfers the full soft
+distribution, which is what makes it expensive: you either keep the teacher
+resident, or cache a full distribution per token — 128k floats per position at
+a modern vocabulary. **If only the support matters, you cache 8 int16 per
+token.** Four orders of magnitude, and distillation stops being an
+infrastructure project.
+
+```bash
+# 1. train a larger teacher on the SAME corpus and cache its top-64
+python -m scripts.train_teacher --teacher-size base --n-steps 9000     --cache-dir ./cache
+
+# 2. the three-way comparison
+python run.py --stage screen --seeds 5     --arms baseline,teach_neural,teach_neural_probs,teach_neural_shuffled     --teacher-table ./cache/teacher_neural_base_v2048_n1000000.npz
+```
+
+| arm | what it does |
+|---|---|
+| `teach_neural` | teacher's top-k IDs, **flattened** — the novel claim |
+| `teach_neural_probs` | the same top-k **with probabilities** — classical distillation |
+| `teach_neural_shuffled` | matched shape, wrong context |
+
+The table is cached at K=64 and `--soft-top-m` truncates at load, so the m sweep
+is free — no retraining, no rebuilding.
+
+## The cheap control that could collapse the whole ladder
+
+`teach_self` takes the model's **own EMA copy's top-k**, flattens it, and uses
+that as the smoothing distribution. No table, no corpus statistics, no external
+teacher, and it scales to any model size for one parameter copy.
+
+**This is not the self-scoring trap.** That failed because using a model's own
+*probabilities* as a target reduces to an entropy knob — `E_{y~p}[log p(y)]` is
+negative entropy. Using its own *support* with flat probabilities is a different
+object, and run 4 says support is the part that matters. `teach_self_probs` runs
+the probability version alongside, so the two can be separated.
+
+If `teach_self` matches the n-gram teacher, **the ladder is unnecessary** and the
+result is a one-line trick. If it does not, the external corpus statistics are
+doing real work. Either outcome is worth knowing. Diagnostics `self_hit_rate` and
+`self_top1_is_true` report how often the EMA's support contains the true token —
+at high epoch counts the EMA has partly memorised the corpus, and that needs
+watching.
+
 ## Measurement (rebuilt after run 3)
 
 Run 3's noise floor was 0.024 nats, nine times run 2's, and every arm's best
@@ -92,7 +143,29 @@ landed at the final eval. Four fixes:
   across arms.
 * **novelty slices.** `novel_bigram_nll` is val loss restricted to (prev,
   target) pairs never seen in training where both tokens are individually
-  frequent. That is the compositional generalisation metric, and it is free.
+  frequent. **Caveat found in run 4: this metric is confounded by global
+  confidence.** Plain label smoothing "wins" it by a mile simply by flattening
+  the distribution. Read the *gap* (novel minus seen), not the raw number.
+* **Welch statistics on the difference.** The old rule — beat baseline by 2x the
+  baseline's own standard deviation — ignored the arm's own variance and tested
+  a threshold rather than a standard error on the quantity being estimated.
+  `--summarise` now reports the mean difference, its standard error, and `t`.
+
+## Bugs fixed after run 4
+
+1. **`--stage screen` ignored `--seeds`** and ran one seed per arm. An entire
+   14-arm screen came back `n=1` with "no noise floor yet" despite `--seeds 3`
+   being passed. Nothing in that table was testable.
+2. **EMA warm-up spike.** The average accumulated from step 0 but evaluation
+   switched to it at `--ema-warmup`, so val ppl spiked to 132 at step 750 and
+   took ~2000 steps to wash out. The EMA is now reset to the live weights at
+   warm-up instead of averaging in the random initialisation.
+3. **Cached teachers lost their build-time diagnostics** (`class_singleton_frac`
+   came back `nan`), which silently hid the exact degeneracy the diagnostic
+   exists to catch. Now saved to a JSON sidecar.
+4. **Primary metric is now the robust floor** (mean of the k lowest evals) rather
+   than the single minimum, which is downward-biased in proportion to trajectory
+   noise — and that bias differs across arms.
 
 ## The two earlier axes
 

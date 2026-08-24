@@ -97,6 +97,10 @@ def row_from_result(res: dict, args, model, corpus) -> dict:
         "noise_floor": res.get("noise_floor", ""),
         "confound": res.get("confound", ""),
         "is_comparable_group": 1,
-        "metric_primary": "best_val_loss_nats",
-        "metric_primary_value": res.get("best_val_loss", ""),
+        # The minimum over ~36 noisy evals is downward-biased in proportion to
+        # trajectory noise, and that bias differs across arms. The mean of the k
+        # lowest evals estimates the same quantity with far less variance.
+        "metric_primary": "robust_val_loss_nats",
+        "metric_primary_value": res.get("robust_val_loss", res.get("best_val_loss", "")),
+        "test_ppl": res.get("best_val_loss", ""),
     }

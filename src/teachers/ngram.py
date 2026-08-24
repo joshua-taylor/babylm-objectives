@@ -91,6 +91,7 @@ class VarOrderTeacher(Teacher):
         r = super().report(*a)
         h = getattr(self, "order_hist", None)
         if h is not None:
+            h = np.asarray(h)          # may come back from the JSON sidecar as a list
             tot = max(int(h.sum()), 1)
             r["order_mix"] = {f"o{k}": round(float(h[k]) / tot, 3)
                               for k in range(len(h)) if h[k] > 0}

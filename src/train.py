@@ -133,6 +133,7 @@ def run(args):
     # was 0.024 nats, nine times run 2's. Averaging the weights and evaluating
     # the average is the standard fix and costs one parameter copy.
     ema = None
+    ema_started = False
     if args.ema_decay > 0:
         ema = {k: v.detach().clone().float() for k, v in model.state_dict().items()}
 
@@ -163,6 +164,16 @@ def run(args):
         sch.step()
         objective.on_optimizer_step(step)
         if ema is not None:
+            # Run 4 bug: the EMA accumulated from step 0 but evaluation switched to
+            # it at ema_warmup, so val ppl spiked to 132 at step 750 and took ~2000
+            # steps to wash out. Reset the average to the live weights at warmup
+            # instead of averaging in the random initialisation.
+            if not ema_started and step <= args.ema_warmup:
+                with torch.no_grad():
+                    for k, v in model.state_dict().items():
+                        ema[k] = v.detach().clone().float()
+                if step == args.ema_warmup:
+                    ema_started = True
             d = args.ema_decay
             with torch.no_grad():
                 for k, v in model.state_dict().items():
