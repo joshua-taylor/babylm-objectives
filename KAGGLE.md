@@ -5,18 +5,36 @@ notebook settings.
 
 ## Cell 1 — setup and smoke test
 
+**Re-runnable.** The `os.chdir` on the first line is load-bearing: on a re-run the
+kernel is sitting *inside* the repo from the previous `%cd`, and deleting the
+directory you are standing in breaks `getcwd()` for every subsequent subprocess
+(`fatal: Unable to read current working directory`). Step out first, always.
+
 ```python
-!pip -q install datasets tokenizers 2>/dev/null
-!rm -rf /kaggle/working/babylm-objectives
-!git clone -q https://github.com/joshua-taylor/babylm-objectives.git /kaggle/working/babylm-objectives
-%cd /kaggle/working/babylm-objectives
-!python -m scripts.smoke
+import os, shutil, subprocess
+
+REPO = "/kaggle/working/babylm-objectives"
+os.chdir("/kaggle/working")                      # never stand inside what we delete
+shutil.rmtree(REPO, ignore_errors=True)          # pure-Python: no subshell, no getcwd
+
+subprocess.run(["pip", "-q", "install", "datasets", "tokenizers"], check=False)
+subprocess.run(
+    ["git", "clone", "-q",
+     "https://github.com/joshua-taylor/babylm-objectives.git", REPO],
+    check=True, cwd="/kaggle/working")
+
+os.chdir(REPO)
+print("cwd:", os.getcwd())
+subprocess.run(["python", "scripts/smoke.py"], check=True)
 ```
+
+If a cell ever fails with `getcwd: cannot access parent directories`, the kernel's
+working directory has been deleted. Run `import os; os.chdir("/kaggle/working")`
+in a fresh cell and carry on — no restart needed.
 
 ## Cell 1b — data sanity gate (run this before anything else, ~3 min)
 
 ```python
-%cd /kaggle/working/babylm-objectives
 !python run.py --arm baseline --n-steps 300 --eval-every 100 \
     --size small --cache-dir /kaggle/working/cache \
     --out-dir /kaggle/working/results --registry /tmp/throwaway.csv
@@ -30,7 +48,6 @@ anything.
 ## Cell 2 — noise floor (do this first, ~20 min)
 
 ```python
-%cd /kaggle/working/babylm-objectives
 !python run.py --stage noisefloor \
     --size small --n-steps 1500 --batch-size 32 --seq-len 256 --dropout 0.1 \
     --cache-dir /kaggle/working/cache \
@@ -41,7 +58,6 @@ anything.
 ## Cell 3 — screen all arms (~1.5–2 h)
 
 ```python
-%cd /kaggle/working/babylm-objectives
 !python run.py --stage screen --seeds 3 \
     --size small --n-steps 1500 --batch-size 32 --seq-len 256 --dropout 0.1 \
     --cache-dir /kaggle/working/cache \
@@ -89,12 +105,26 @@ anything.
 ## Cell A — setup
 
 ```python
-!pip -q install datasets tokenizers 2>/dev/null
-!rm -rf /kaggle/working/babylm-objectives
-!git clone -q https://github.com/joshua-taylor/babylm-objectives.git /kaggle/working/babylm-objectives
-%cd /kaggle/working/babylm-objectives
-!python -m scripts.smoke
+import os, shutil, subprocess
+
+REPO = "/kaggle/working/babylm-objectives"
+os.chdir("/kaggle/working")                      # never stand inside what we delete
+shutil.rmtree(REPO, ignore_errors=True)
+
+subprocess.run(["pip", "-q", "install", "datasets", "tokenizers"], check=False)
+subprocess.run(["git", "clone", "-q",
+                "https://github.com/joshua-taylor/babylm-objectives.git", REPO],
+               check=True, cwd="/kaggle/working")
+os.chdir(REPO)
+print("cwd:", os.getcwd())
+subprocess.run(["python", "scripts/smoke.py"], check=True)
 ```
+
+> **Why not `!rm -rf` + `%cd`?** On a re-run the kernel is already inside the repo
+> from the previous `%cd`. Deleting your own working directory breaks `getcwd()`
+> for every subsequent subprocess, and `git clone` dies with
+> `fatal: Unable to read current working directory`. The first run works; the
+> second does not.
 
 ## Cell B — the cheap control FIRST (~25 min)
 
